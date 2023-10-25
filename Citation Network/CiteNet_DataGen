@@ -1,0 +1,275 @@
+# -*- coding: utf-8 -*-
+"""
+Code for getting the wanted citation network json file (disruptiveness indicator) of a WoS dataset (a .csv file)
+@author: Letian
+"""
+
+import os
+import json
+import csv
+import pickle
+import pandas as pd
+import gc
+import re
+import tqdm
+import shutil
+
+
+def list_upper(list_lower):
+    return list(map(str.upper, list(map(str, list_lower))))
+
+
+def re_sub_comma(temp):
+    return re.sub(r',', '', temp.group())
+
+
+def cr_match(vl, bp, di, cr_match_str):
+    cr_match_list = re.split(r'\|\|', cr_match_str)
+    if cr_match_list[0] and (cr_match_list[0] != vl):
+        return False
+    if cr_match_list[1] and (cr_match_list[1] != bp):
+        return False
+    if cr_match_list[2]:
+        for di_cr in re.split(r', ', cr_match_list[2]):
+            if di_cr in di:
+                return True
+        return False
+    return True
+
+
+def cr_match_string_gen(cr):
+    ret = re.search(r'^ *(.*?), (.*?), (.*?)(?P<VL>, V {,2}([\dA-Za-z]|[\./][\dA-Za-z])[-\dA-Za-z\./ ]*)?'
+                    r'(?P<BP>, (P\d+|p[\da-z]*[a-z][\da-z]*|p[\dA-Z]*[A-Z][\dA-Z]*|p[a-z]+_\d+|p[A-Z]+_\d+|part\. no\.))?'
+                    r'(?P<DI>, DOI ([^,\[\]]+|\[[^,\[\]]+(, [^,\[\]]+)+\]))? *$', cr)
+    if not ret:
+        return None
+    py = ret.group(2)
+    if not re.match(r'^(19\d\d|200\d|201\d)$', py):
+        return None
+    au = re.sub(r'\. ', '.', ret.group(1))
+    so = ret.group(3).upper()
+    if ret.group('VL'):
+        vl = re.search(r'^, V(.*)$', ret.group('VL')).group(1)
+    else:
+        vl = ''
+    if ret.group('BP'):
+        bp = re.search(r'^, [pP](.*)$', ret.group('BP')).group(1)
+    else:
+        bp = ''
+    if ret.group('DI'):
+        di = re.search(r'^, DOI \[?(.*?)\]?$', ret.group('DI')).group(1)
+    else:
+        di = ''
+    return so, py, au, vl, bp, di
+
+
+def data_read_clear2(root_path, paper_file, ys, ye):
+    csv.field_size_limit(500 * 1024 * 1024)  # Extend the maximum recognizable text length
+
+    jfile = pd.read_excel(os.path.join(root_path, 'JournalList.xlsx'))
+    journal_fullname = list_upper(jfile['FT'])
+    journal_dict0 = dict(zip(list_upper(jfile['JI_OLD']), journal_fullname))
+    journal_dict0.update(dict(zip(list_upper(jfile['J9_OLD']), journal_fullname)))
+    journal_dict0.update(dict(zip(list_upper(jfile['JI']), journal_fullname)))
+    journal_dict0.update(dict(zip(list_upper(jfile['J9']), journal_fullname)))
+    if 'NAN' in journal_dict0:
+        del journal_dict0['NAN']
+    journal_fullname = sorted(journal_fullname)
+    journal_all_dict = {}
+    for key in journal_dict0:
+        journal_all_dict[key] = journal_fullname.index(journal_dict0[key])
+    for i in range(len(journal_fullname)):
+        journal_all_dict[journal_fullname[i]] = i
+    del jfile, journal_dict0
+    gc.collect()
+    if os.path.exists(os.path.join(root_path, 'journal_fullname.data')):
+        os.remove(os.path.join(root_path, 'journal_fullname.data'))
+    if os.path.exists(os.path.join(root_path, 'journal_all_dict.data')):
+        os.remove(os.path.join(root_path, 'journal_all_dict.data'))
+    f = open(os.path.join(root_path, 'journal_fullname.data'), 'wb')
+    pickle.dump(journal_fullname, f)
+    f.close()
+    f = open(os.path.join(root_path, 'journal_all_dict.data'), 'wb')
+    pickle.dump(journal_all_dict, f)
+    f.close()
+
+    #  Read the paper file as a dataframe
+    reader = pd.read_csv(os.path.join(root_path, paper_file), iterator=True, sep=',',
+                         usecols=['AU', 'PY', 'SO', 'VL', 'BP', 'DI', 'CR', 'UT'],
+                         dtype={'AU': str, 'PY': int, 'SO': str, 'VL': str, 'BP': str,
+                                'DI': str, 'CR': str, 'UT': str})
+    loop = True
+    flag = 0
+    chunksize = 100000  # The number of rows read each time.The larger this value, the more efficient.
+    chunks = []
+    while loop:
+        try:
+            flag += 1
+            chunk = reader.get_chunk(chunksize)
+            chunks.append(chunk)
+            if flag % 10 == 0:
+                print('%d lines have been processed.\n' % (flag * chunksize))
+        except StopIteration:
+            try:
+                for i in range(0, 100):
+                    chunk = reader.get_chunk(1000)
+                    chunks.append(chunk)
+                print('Exception of RAM not enough happened!')
+                if flag % 10 == 0:
+                    print('%d lines have been processed.\n' % (flag * chunksize))
+            except StopIteration:
+                loop = False
+                print('Iteration is stopped.\n')
+    file_dataframe = pd.concat(chunks, ignore_index=True)
+    del chunks, chunk
+    gc.collect()
+    # clear the undesirable papers (without AU attribute; without PY attribute, or PY value out of range; without SO
+    # attribute, or SO value out of journal list) and convert SO to index.
+    journal_all_dict_str = {}
+    for key in journal_all_dict:
+        journal_all_dict_str[key] = str(journal_all_dict[key])
+    cflag = []  # list containing the indexes of cleared papers
+    for i in range(len(file_dataframe)):
+        if pd.isna(file_dataframe['AU'][i]):
+            cflag.append(i)
+            continue
+        py = file_dataframe['PY'][i]
+        if pd.isna(py) or py < ys or py > ye:
+            cflag.append(i)
+            continue
+        so = file_dataframe['SO'][i]
+        if pd.isna(so):
+            cflag.append(i)
+            continue
+        else:
+            so = so.upper().strip()
+            if so not in journal_all_dict_str:
+                cflag.append(i)
+                continue
+            file_dataframe.at[i, 'SO'] = journal_all_dict_str[so]
+    file_dataframe = file_dataframe.drop(labels=cflag).reset_index(drop=True)  # drop undesirable papers & reset indexes
+    file_dataframe['SO'] = file_dataframe['SO'].astype('int')
+    if os.path.exists(os.path.join(root_path, 'wos_index.data')):
+        os.remove(os.path.join(root_path, 'wos_index.data'))
+    f = open(os.path.join(root_path, 'wos_index.data'), 'wb')
+    pickle.dump(file_dataframe['UT'].tolist(), f)
+    f.close()
+    return journal_fullname, journal_all_dict, file_dataframe
+
+def citenet_datagen(file_dataframe, journal_fullname, journal_all_dict, output_path, ys, ye):
+    if os.path.exists(output_path):
+        shutil.rmtree(output_path)
+    os.makedirs(output_path)
+    l1 = len(file_dataframe)
+    lj = len(journal_fullname)
+    # Preliminary Cleaning CR List
+    # cr_sum，list[list[dict{dict{}}]]. cr_sum[i][j][k] represents a dictionary composed of cr&its extracted information
+    # with first author k, journal journal_fullname[j] and publication year i+ys.
+    cr_sum = [[{}] * lj] * (ye - ys + 1)
+    file_dataframe['CR_CLR'] = [[]] * l1
+    for i in tqdm.tqdm(range(l1), desc='CR clearing'):
+        cr = file_dataframe['CR'][i]
+        if pd.isna(cr):
+            continue
+        cr_clr = []
+        for cr_line in re.split(r' *; *', cr):
+            cm = cr_match_string_gen(cr_line)
+            if not cm:
+                continue
+            if cm[0] not in journal_all_dict:
+                continue
+            so_index = journal_all_dict[cm[0]]
+            py = int(cm[1])
+            y_index = py-ys
+            if py < ys or py > ye:
+                continue
+            if cm[2] not in cr_sum[y_index][so_index]:
+                cr_sum[y_index][so_index][cm[2]] = {cr_line: cm[3] + '||' + cm[4] + '||' + cm[5]}
+            else:
+                if cr_line not in cr_sum[y_index][so_index][cm[2]]:
+                    cr_sum[y_index][so_index][cm[2]][cr_line] = cm[3] + '||' + cm[4] + '||' + cm[5]
+            cr_clr.append(str(so_index) + '||' + cr_line)
+        file_dataframe.at[i, 'CR_CLR'] = cr_clr
+    cr2ut_sum = [{}] * lj
+    for i in tqdm.tqdm(range(l1), desc='Mapping start'):
+        py = file_dataframe['PY'][i]
+        so = file_dataframe['SO'][i]
+        y_index = py-ys
+        au = re.sub(r'[- ,]*[- ][- ,]*', re_sub_comma,
+                    re.search(r'^[ \.]*(.*?)[ \.]*($|;)', file_dataframe['AU'][i]).group(1))
+        au = re.sub(r' ([a-zA-Z],)+[a-zA-Z]$', re_sub_comma, re.sub(r'\. ', '.', au))
+        if au not in cr_sum[y_index][so]:
+            continue
+        ut = file_dataframe['UT'][i][4:]
+        vl = file_dataframe['VL'][i]
+        bp = file_dataframe['BP'][i]
+        di = file_dataframe['DI'][i]
+        if pd.isna(vl):
+            vl = ''
+        if pd.isna(bp):
+            bp = ''
+        if pd.isna(di):
+            di = ''
+        else:
+            di = re.split(r'; ', di)
+        for cr_line in cr_sum[y_index][so][au]:
+            if cr_match(vl, bp, di, cr_sum[y_index][so][au][cr_line]):
+                if cr_line in cr2ut_sum[so]:
+                    cr2ut_sum[so][cr_line].append(ut)
+                else:
+                    cr2ut_sum[so][cr_line] = [ut]
+    del cr_sum
+    gc.collect()
+    for i in tqdm.tqdm(range(lj), desc='Multi CR-UT mappings\' clearing'):
+        for cr_line in list(cr2ut_sum[i].keys()):
+            if len(cr2ut_sum[i][cr_line]) != 1:
+                del cr2ut_sum[i][cr_line]
+    ut_ind = {}
+    for i in range(l1):
+        ut = file_dataframe['UT'][i][4:]
+        ut_ind[ut] = i
+    file_dataframe['LR'] = [[]] * l1
+    for i in tqdm.tqdm(range(l1), desc='LR conversion'):
+        lr_list = []
+        for cr_line in file_dataframe['CR_CLR'][i]:
+            pl = re.split(r'\|\|', cr_line)
+            if pl[1] not in cr2ut_sum[int(pl[0])]:
+                continue
+            lr_list.append(cr2ut_sum[int(pl[0])][pl[1]][0])
+        file_dataframe.at[i, 'LR'] = lr_list
+    del cr2ut_sum
+    gc.collect()
+
+    py_set = set(file_dataframe['PY'][:])
+    for py in py_set:
+        paper_py_list = []
+        index_py_list = file_dataframe[file_dataframe.PY == py].index.tolist()
+        for i in tqdm.tqdm(range(len(index_py_list)), desc='{} data'.format(py)):
+            paper_dict = {}
+            index = index_py_list[i]
+            paper_dict['PMID'] = index
+            paper_dict['year'] = int(file_dataframe['PY'][index])
+            cr_list = []
+            for cr_item in file_dataframe['LR'][index]:
+                cr_list.append(ut_ind[cr_item])
+            paper_dict['refs_pmid_wos'] = cr_list
+            paper_py_list.append(paper_dict)
+        with open(os.path.join(output_path, '{}.json'.format(py)), 'w', encoding='UTF-8') as fp:
+            json.dump(paper_py_list, fp)
+    return
+
+
+if __name__ == '__main__':
+    root_path = ''  # directory containing all files
+    paper_file = ''  # paper information file
+    output_path = ''  # directory json outputs to
+
+    # Needed files: 'JournalList.xlsx'; paper information file. (Both must locate in root_path)
+    # Generated files: 'journal_fullname.data'; 'journal_all_dict.data'; 'wos_index.data'. (All locate in root_path)
+    # data_read_clear2: ys-considered start year; ye-considered end year.
+    journal_fullname, journal_all_dict, file_dataframe = data_read_clear2(root_path, paper_file, 1960, 2019)
+
+    # Needed files: None
+    # Generated files: json files. (All locate in output_path)
+    citenet_datagen(file_dataframe, journal_fullname, journal_all_dict, output_path, 1960, 2019)
+
